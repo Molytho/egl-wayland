@@ -929,6 +929,47 @@ done:
     return result;
 }
 
+static const char *tryGetDrmRenderNode(WlEglPlatformData *platform_data, EGLDeviceEXT device) {
+    const char *dev_exts = platform_data->egl.queryDeviceString(device, EGL_EXTENSIONS);
+    if (dev_exts && wlEglFindExtension("EGL_EXT_device_drm_render_node", dev_exts)) {
+        return platform_data->egl.queryDeviceString(device, EGL_DRM_RENDER_NODE_FILE_EXT);
+    }
+    return NULL;
+}
+
+/*
+ * Gets a device node path.
+ * Prefers the render node if EGL_EXT_device_drm_render_node is available,
+ * otherwise falls back to EGL_EXT_device_drm thus returning either a primary node or a render node
+ */
+static const char *getDrmDeviceNode(WlEglPlatformData *platform_data, EGLDeviceEXT device) {
+    const char *node = tryGetDrmRenderNode(platform_data, device);
+    if (node == NULL) {
+        node = platform_data->egl.queryDeviceString(device, EGL_DRM_DEVICE_FILE_EXT);
+    }
+    return node;
+}
+
+/*
+ * Opens a device node file descriptor.
+ * Prefers the render node if EGL_EXT_device_drm_render_node is available,
+ * otherwise falls back to EGL_EXT_device_drm thus returning either a primary node or a render node
+ */
+static int openDrmDeviceNode(WlEglPlatformData *platform_data, EGLDeviceEXT device, int oflag) {
+    int fd = -1;
+    const char *node = tryGetDrmRenderNode(platform_data, device);
+    if (node != NULL) {
+        fd = open(node, oflag);
+    }
+    if (fd < 0 || node == NULL) {
+        node = platform_data->egl.queryDeviceString(device, EGL_DRM_DEVICE_FILE_EXT);
+        if (node != NULL) {
+            fd = open(node, oflag);
+        }
+    }
+    return fd;
+}
+
 EGLDisplay wlEglGetPlatformDisplayExport(void *data,
                                          EGLenum platform,
                                          void *nativeDpy,
@@ -948,7 +989,6 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     EGLDeviceEXT requestedDevice = EGL_NO_DEVICE_EXT;
     EGLBoolean usePrimeRenderOffload = EGL_FALSE;
     EGLBoolean isServerNV;
-    const char *drmName = NULL;
 
     if (platform != EGL_PLATFORM_WAYLAND_EXT) {
         wlEglSetError(data, EGL_BAD_PARAMETER);
@@ -1081,28 +1121,21 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     if (protocols.drm_name) {
         for (i = 0; i < numDevices; i++) {
             EGLDeviceEXT tmpDev = eglDeviceList[i];
-
             /*
              * To check against the wl_drm name, we need to check if we can use
              * the drm extension
              */
-            const char *dev_exts = display->data->egl.queryDeviceString(tmpDev,
-                    EGL_EXTENSIONS);
-            if (dev_exts && wlEglFindExtension("EGL_EXT_device_drm_render_node", dev_exts)) {
-                const char *dev_name = display->data->egl.queryDeviceString(tmpDev,
-                            EGL_DRM_RENDER_NODE_FILE_EXT);
-
-                if (dev_name) {
-                    /*
-                     * At this point we have gotten the name from wl_drm, gotten
-                     * the drm node from the EGLDevice. If they match, then
-                     * this is the final device to use, since it is the compositor's
-                     * device.
-                     */
-                    if (strcmp(dev_name, protocols.drm_name) == 0) {
-                        serverDevice = tmpDev;
-                        break;
-                    }
+            const char *dev_name = getDrmDeviceNode(display->data, tmpDev);
+            if (dev_name) {
+                /*
+                 * At this point we have gotten the name from wl_drm, gotten
+                 * the drm node from the EGLDevice. If they match, then
+                 * this is the final device to use, since it is the compositor's
+                 * device.
+                 */
+                if (strcmp(dev_name, protocols.drm_name) == 0) {
+                    serverDevice = tmpDev;
+                    break;
                 }
             }
         }
@@ -1191,13 +1224,7 @@ EGLDisplay wlEglGetPlatformDisplayExport(void *data,
     WL_LIST_INIT(&display->wlEglSurfaceList);
 
     /* Get the DRM device in use */
-    drmName = display->data->egl.queryDeviceString(display->devDpy->eglDevice,
-                                                   EGL_DRM_DEVICE_FILE_EXT);
-    if (!drmName) {
-        goto fail;
-    }
-
-    display->drmFd = open(drmName, O_RDWR | O_CLOEXEC);
+    display->drmFd = openDrmDeviceNode(display->data, display->devDpy->eglDevice, O_RDWR | O_CLOEXEC);
     if (display->drmFd < 0) {
         goto fail;
     }
